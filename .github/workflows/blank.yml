@@ -1,0 +1,544 @@
+name: mlx-qwen-preliminaries-console-fixed
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  preliminaries:
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      HF_HOME: ${{ github.workspace }}/.hf-cache
+      HF_HUB_ENABLE_HF_TRANSFER: "1"
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      MODEL_ID: Qwen/Qwen2-0.5B
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache Hugging Face model files
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.hf-cache
+          key: ${{ runner.os }}-hf-${{ github.run_id }}-${{ env.MODEL_ID }}
+          restore-keys: |
+            ${{ runner.os }}-hf-
+
+      - name: System and environment info
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "================ SYSTEM INFO ================"
+          sw_vers
+          uname -a
+          python --version
+          which python
+          echo "PWD=$(pwd)"
+          echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
+          echo "HF_HOME=${HF_HOME}"
+          if [ -n "${HF_TOKEN:-}" ]; then
+            echo "HF_TOKEN_PRESENT=yes"
+          else
+            echo "HF_TOKEN_PRESENT=no"
+          fi
+          echo "============================================"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip wheel setuptools
+          python -m pip install mlx mlx-lm huggingface_hub numpy pyyaml
+
+      - name: Print installed package versions
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import importlib
+          print("============== PACKAGE VERSIONS ==============")
+          for name in ["mlx", "mlx_lm", "huggingface_hub", "numpy", "yaml"]:
+              mod = importlib.import_module(name)
+              print(f"{name}: {getattr(mod, '__version__', 'unknown')}")
+          print("==============================================")
+          PY
+
+      - name: Hugging Face connectivity check
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import os
+          from huggingface_hub import HfApi
+
+          print("=============== HF HUB CHECK =================")
+          token = os.environ.get("HF_TOKEN")
+          print("HF_TOKEN_PRESENT =", bool(token))
+          print("HF_HOME =", os.environ.get("HF_HOME"))
+          api = HfApi(token=token if token else None)
+          info = api.model_info("Qwen/Qwen2-0.5B")
+          print("MODEL_EXISTS =", info.id)
+          print("==============================================")
+          PY
+
+      - name: Run everything inline ultra-verbosely
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import math
+          import os
+          import platform
+          import random
+          import sys
+
+          import mlx.core as mx
+          from mlx_lm import load
+
+          random.seed(0)
+
+          MODEL_ID = os.environ.get("MODEL_ID", "Qwen/Qwen2-0.5B")
+          HF_TOKEN = os.environ.get("HF_TOKEN")
+          HF_HOME = os.environ.get("HF_HOME")
+
+          print("\n\n============================================================")
+          print("STEP 1: GLOBAL STARTUP SELF-CHECK")
+          print("============================================================")
+          print("PYTHON_VERSION =", sys.version)
+          print("PLATFORM =", platform.platform())
+          print("MODEL_ID =", MODEL_ID)
+          print("HF_HOME =", HF_HOME)
+          print("HF_TOKEN_PRESENT =", bool(HF_TOKEN))
+
+          print("\nLoading model and tokenizer with mlx_lm.load(...)")
+          model, tokenizer = load(MODEL_ID)
+          print("MODEL_CLASS =", type(model).__name__)
+          print("TOKENIZER_CLASS =", type(tokenizer).__name__)
+
+          vocab_size = getattr(tokenizer, "vocab_size", None)
+          print("TOKENIZER_VOCAB_SIZE =", vocab_size)
+
+          def tokenize(tok, text):
+              if hasattr(tok, "encode"):
+                  ids = tok.encode(text)
+                  if ids and isinstance(ids[0], list):
+                      ids = ids[0]
+                  return list(ids)
+              raise RuntimeError("Could not tokenize prompt with available tokenizer API")
+
+          def extract_logits(out):
+              if hasattr(out, "logits"):
+                  return out.logits
+              if isinstance(out, tuple) and len(out) > 0:
+                  return out[0]
+              return out
+
+          def to_float_list(x):
+              return [float(v) for v in x.tolist()]
+
+          def to_int_list(x):
+              return [int(v) for v in x.tolist()]
+
+          def topk_ids_and_vals(probs32, k):
+              # FIXED: compute indices first, then gather matching values.
+              idx = mx.argsort(probs32, axis=-1)[-k:]
+              idx = idx[::-1]
+              vals = probs32[idx]
+              return idx, vals
+
+          def print_prob_summary(probs32, label, topn=10):
+              print(f"{label}_SHAPE =", probs32.shape)
+              print(f"{label}_DTYPE =", probs32.dtype)
+              print(f"{label}_SUM =", float(mx.sum(probs32).item()))
+              idx, vals = topk_ids_and_vals(probs32, topn)
+              print(f"{label}_TOP{topn}_IDS =", to_int_list(idx))
+              print(f"{label}_TOP{topn}_PROBS =", to_float_list(vals))
+
+          def normalize_probs(x, eps=1e-12):
+              x = mx.maximum(x, eps)
+              s = mx.sum(x)
+              return x / s
+
+          startup_prompts = [
+              "Hello world",
+              "The capital of France is",
+              "2 + 2 =",
+          ]
+
+          for i, prompt in enumerate(startup_prompts):
+              print("\n------------------------------------------------------------")
+              print(f"STARTUP PROMPT {i}")
+              print("------------------------------------------------------------")
+              print("TEXT =", repr(prompt))
+              ids = tokenize(tokenizer, prompt)
+              print("TOKEN_IDS =", ids)
+              print("TOKEN_IDS_TYPE =", type(ids).__name__)
+              print("FIRST_TOKEN_TYPE =", type(ids[0]).__name__ if ids else None)
+              assert all(isinstance(x, int) for x in ids), "Token ids must be Python ints"
+
+              x = mx.array([ids], dtype=mx.int32)
+              print("INPUT_SHAPE =", x.shape)
+              print("INPUT_DTYPE =", x.dtype)
+
+              out = model(x)
+              logits = extract_logits(out)
+              print("LOGITS_TYPE =", type(logits).__name__)
+              print("LOGITS_SHAPE =", logits.shape)
+              print("LOGITS_DTYPE =", getattr(logits, "dtype", None))
+
+              if len(logits.shape) == 3:
+                  next_logits = logits[0, -1, :]
+              elif len(logits.shape) == 2:
+                  next_logits = logits[-1, :]
+              else:
+                  raise RuntimeError(f"Unexpected logits shape: {logits.shape}")
+
+              probs = mx.softmax(next_logits, axis=-1).astype(mx.float32)
+              probs = normalize_probs(probs)
+              print_prob_summary(probs, "STARTUP_PROBS", topn=10)
+
+              if vocab_size is not None:
+                  print("VOCAB_MATCH =", probs.shape[-1] == vocab_size)
+                  print("MODEL_VOCAB_SIZE =", probs.shape[-1])
+                  if probs.shape[-1] != vocab_size:
+                      print("WARNING = tokenizer vocab size and logits vocab size differ")
+                      print("NOTE = this can happen with wrapper/tokenizer metadata; KL still uses model output support")
+
+          print("\nQWEN_STARTUP_SELF_CHECK = PASS")
+
+          print("\n\n============================================================")
+          print("STEP 2: TOY INTERFACE EXPERIMENT")
+          print("============================================================")
+
+          def toy_softmax(xs):
+              m = max(xs)
+              ex = [math.exp(x - m) for x in xs]
+              s = sum(ex)
+              return [x / s for x in ex]
+
+          def toy_kl(p, q, eps=1e-12):
+              total = 0.0
+              for pi, qi in zip(p, q):
+                  pi = max(pi, eps)
+                  qi = max(qi, eps)
+                  total += pi * math.log(pi / qi)
+              return total
+
+          def toy_argmax_view(p):
+              idx = max(range(len(p)), key=lambda i: p[i])
+              out = [0.0] * len(p)
+              out[idx] = 1.0
+              return out
+
+          def toy_topk_view(p, k=3):
+              idx = sorted(range(len(p)), key=lambda i: p[i], reverse=True)[:k]
+              vals = [p[i] for i in idx]
+              s = sum(vals)
+              out = [0.0] * len(p)
+              for i, v in zip(idx, vals):
+                  out[i] = v / s
+              return out
+
+          toy_logits = [1.7, 0.9, 0.4, -0.2, -1.1]
+          toy_victim = toy_softmax(toy_logits)
+          print("TOY_VICTIM =", toy_victim)
+
+          toy_results = []
+          toy_students = {
+              "argmax": toy_argmax_view(toy_victim),
+              "topk": toy_topk_view(toy_victim, 3),
+              "probs": list(toy_victim),
+          }
+
+          for interface, student in toy_students.items():
+              agreement = int(
+                  max(range(len(student)), key=lambda i: student[i]) ==
+                  max(range(len(toy_victim)), key=lambda i: toy_victim[i])
+              )
+              kl = toy_kl(toy_victim, student)
+              toy_results.append((interface, agreement, kl))
+
+              print("\nINTERFACE =", interface)
+              print("STUDENT =", student)
+              print("AGREEMENT =", agreement)
+              print("KL =", kl)
+
+          print("\nTOY_FINAL_SUMMARY")
+          for interface, agreement, kl in toy_results:
+              print(f"TOY interface={interface} agreement={agreement:.6f} kl={kl:.6f}")
+
+          print("\n\n============================================================")
+          print("STEP 3: QWEN QUERY-LIMITED ESTIMATOR EXPERIMENT")
+          print("============================================================")
+          print("IMPORTANT = this is no longer an identity/projection baseline only")
+          print("IMPORTANT = budget changes the student because the student is built")
+          print("IMPORTANT = from the first N queried prompts in the training pool")
+          print("IMPORTANT = this is still a lightweight estimator, not a full neural distillation run")
+
+          def one_hot_from_top1(probs32):
+              idx = int(mx.argmax(probs32).item())
+              out = mx.zeros_like(probs32)
+              out[idx] = 1.0
+              return out
+
+          def topk_view(probs32, k=5):
+              idx, vals = topk_ids_and_vals(probs32, k)
+              vals = vals / mx.sum(vals)
+              out = mx.zeros_like(probs32)
+              for j in range(k):
+                  out[int(idx[j].item())] = vals[j]
+              return out
+
+          def kl_mx(p, q, eps=1e-12):
+              p = mx.maximum(p, eps)
+              q = mx.maximum(q, eps)
+              return mx.sum(p * mx.log(p / q))
+
+          # Larger pool so budget actually matters
+          train_prompts = [
+              "The capital of France is",
+              "The capital of Germany is",
+              "The capital of Italy is",
+              "The capital of Spain is",
+              "The capital of Japan is",
+              "The capital of China is",
+              "2 + 2 =",
+              "3 + 3 =",
+              "4 + 4 =",
+              "5 + 5 =",
+              "The opposite of cold is",
+              "The opposite of hot is",
+              "The opposite of up is",
+              "The opposite of left is",
+              "The largest planet in the solar system is",
+              "The smallest prime number is",
+              "The chemical symbol for water is",
+              "The first month of the year is",
+              "The color of the sky on a clear day is",
+              "The animal that says meow is a",
+              "The capital of Portugal is",
+              "The capital of the UK is",
+              "The capital of Canada is",
+              "The capital of India is",
+              "The capital of Australia is",
+              "6 + 6 =",
+              "7 + 7 =",
+              "8 + 8 =",
+              "9 + 9 =",
+              "10 + 10 =",
+              "The opposite of dark is",
+              "The opposite of tall is",
+              "The opposite of fast is",
+              "The opposite of open is",
+              "The largest ocean on Earth is",
+              "The currency of Japan is the",
+              "The currency of the US is the",
+              "The day after Monday is",
+              "The day before Friday is",
+              "A triangle has how many sides?",
+              "The capital of Brazil is",
+              "The capital of Mexico is",
+              "The capital of South Korea is",
+              "The capital of Russia is",
+              "The capital of Egypt is",
+              "11 + 11 =",
+              "12 + 12 =",
+              "13 + 13 =",
+              "14 + 14 =",
+              "15 + 15 =",
+              "The opposite of noisy is",
+              "The opposite of young is",
+              "The opposite of happy is",
+              "The opposite of strong is",
+              "The tallest land animal is the",
+              "The boiling point of water in Celsius is",
+              "The largest mammal is the",
+              "The capital of the Netherlands is",
+              "The capital of Belgium is",
+              "The capital of Sweden is",
+              "The capital of Norway is",
+              "The capital of Denmark is",
+              "16 + 16 =",
+              "17 + 17 =",
+              "18 + 18 =",
+              "19 + 19 =",
+              "20 + 20 =",
+            ]
+
+          eval_prompts = [
+              "The capital of France is",
+              "2 + 2 =",
+              "The opposite of cold is",
+              "The largest planet in the solar system is",
+              "The capital of Japan is",
+              "The opposite of dark is",
+              "The chemical symbol for water is",
+              "A triangle has how many sides?",
+            ]
+
+          budgets = [4, 8, 16, 32, 64]
+          interfaces = ["argmax", "topk", "probs"]
+
+          def qwen_next_token_distribution(prompt_text):
+              ids = tokenize(tokenizer, prompt_text)
+              x = mx.array([ids], dtype=mx.int32)
+              out = model(x)
+              logits = extract_logits(out)
+              if len(logits.shape) == 3:
+                  next_logits = logits[0, -1, :]
+              elif len(logits.shape) == 2:
+                  next_logits = logits[-1, :]
+              else:
+                  raise RuntimeError(f"Unexpected logits shape: {logits.shape}")
+              probs = mx.softmax(next_logits, axis=-1).astype(mx.float32)
+              probs = normalize_probs(probs)
+              return ids, probs
+
+          def build_student_from_budget(interface, budget, train_prompts):
+              print("\n>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
+              print("BUILDING STUDENT")
+              print("INTERFACE =", interface)
+              print("BUDGET =", budget)
+              print("TRAIN_PROMPTS_USED =", budget)
+              print(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
+
+              used_prompts = train_prompts[:budget]
+              accum = None
+
+              for i, prompt in enumerate(used_prompts):
+                  print("\nTRAIN_PROMPT_INDEX =", i)
+                  print("TRAIN_PROMPT_TEXT =", repr(prompt))
+                  ids, victim_probs = qwen_next_token_distribution(prompt)
+                  print("TRAIN_TOKEN_IDS_LEN =", len(ids))
+                  print("TRAIN_VICTIM_SUM =", float(mx.sum(victim_probs).item()))
+                  idx, vals = topk_ids_and_vals(victim_probs, 5)
+                  print("TRAIN_VICTIM_TOP5_IDS =", to_int_list(idx))
+                  print("TRAIN_VICTIM_TOP5_PROBS =", to_float_list(vals))
+
+                  if interface == "argmax":
+                      target = one_hot_from_top1(victim_probs)
+                  elif interface == "topk":
+                      target = topk_view(victim_probs, k=5)
+                  elif interface == "probs":
+                      target = victim_probs
+                  else:
+                      raise RuntimeError(interface)
+
+                  print("TRAIN_TARGET_SUM =", float(mx.sum(target).item()))
+                  idx_t, vals_t = topk_ids_and_vals(target, 5)
+                  print("TRAIN_TARGET_TOP5_IDS =", to_int_list(idx_t))
+                  print("TRAIN_TARGET_TOP5_PROBS =", to_float_list(vals_t))
+
+                  if accum is None:
+                      accum = mx.zeros_like(target)
+                  accum = accum + target
+
+              student = normalize_probs(accum)
+              print("\nSTUDENT_BUILT")
+              print("STUDENT_SUM =", float(mx.sum(student).item()))
+              idx_s, vals_s = topk_ids_and_vals(student, 10)
+              print("STUDENT_GLOBAL_TOP10_IDS =", to_int_list(idx_s))
+              print("STUDENT_GLOBAL_TOP10_PROBS =", to_float_list(vals_s))
+              return student
+
+          qwen_results = []
+
+          for budget in budgets:
+              print("\n############################################################")
+              print("QWEN BUDGET =", budget)
+              print("############################################################")
+
+              for interface in interfaces:
+                  print("\n************************************************************")
+                  print("QWEN INTERFACE =", interface)
+                  print("************************************************************")
+
+                  student32 = build_student_from_budget(interface, budget, train_prompts)
+
+                  agreements = []
+                  kls = []
+
+                  for p_i, prompt in enumerate(eval_prompts):
+                      print("\n------------------------------------------------------------")
+                      print(f"EVAL_PROMPT_INDEX = {p_i}")
+                      print("EVAL_PROMPT_TEXT =", repr(prompt))
+                      print("------------------------------------------------------------")
+
+                      ids, victim32 = qwen_next_token_distribution(prompt)
+
+                      print("EVAL_TOKEN_IDS =", ids)
+                      print("EVAL_TOKEN_IDS_LEN =", len(ids))
+                      print("EVAL_TOKEN_IDS_TYPE =", type(ids).__name__)
+                      print("FIRST_TOKEN_TYPE =", type(ids[0]).__name__ if ids else None)
+
+                      print("VICTIM_VOCAB_SIZE =", victim32.shape[-1])
+                      print("VICTIM_PROB_SUM =", float(mx.sum(victim32).item()))
+                      print_prob_summary(victim32, "VICTIM", topn=10)
+
+                      print("STUDENT_VOCAB_SIZE =", student32.shape[-1])
+                      print("STUDENT_PROB_SUM =", float(mx.sum(student32).item()))
+                      print_prob_summary(student32, "STUDENT", topn=10)
+
+                      victim_top1 = int(mx.argmax(victim32).item())
+                      student_top1 = int(mx.argmax(student32).item())
+
+                      agreement = int(student_top1 == victim_top1)
+                      kl = float(kl_mx(victim32, student32).item())
+
+                      print("VICTIM_TOP1_ID =", victim_top1)
+                      print("STUDENT_TOP1_ID =", student_top1)
+                      print("AGREEMENT =", agreement)
+                      print("KL =", kl)
+
+                      agreements.append(agreement)
+                      kls.append(kl)
+
+                  mean_agreement = sum(agreements) / len(agreements)
+                  mean_kl = sum(kls) / len(kls)
+
+                  qwen_results.append((budget, interface, mean_agreement, mean_kl))
+
+                  print("\nQWEN_INTERFACE_SUMMARY")
+                  print("BUDGET =", budget)
+                  print("INTERFACE =", interface)
+                  print("MEAN_AGREEMENT =", mean_agreement)
+                  print("MEAN_KL =", mean_kl)
+
+          print("\n\n============================================================")
+          print("STEP 4: FINAL PLAIN-TEXT SUMMARY")
+          print("============================================================")
+
+          print("\nTOY SUMMARY TABLE")
+          print("source interface agreement kl")
+          for interface, agreement, kl in toy_results:
+              print(f"toy {interface} {agreement:.6f} {kl:.6f}")
+
+          print("\nQWEN SUMMARY TABLE")
+          print("source budget interface agreement kl")
+          for budget, interface, agreement, kl in qwen_results:
+              print(f"qwen {budget} {interface} {agreement:.6f} {kl:.6f}")
+
+          print("\nALL_PRELIMINARIES_COMPLETED = PASS")
+          PY
+
+      - name: Final note
+        if: always()
+        shell: bash
+        run: |
+          echo "============================================================"
+          echo "DONE"
+          echo "Everything was printed directly to the console."
+          echo "This workflow is intentionally single-file and ultra-verbose."
+          echo "The Qwen experiment now uses a query-limited estimator so budget matters."
+          echo "============================================================"
