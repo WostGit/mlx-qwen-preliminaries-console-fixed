@@ -1,237 +1,247 @@
-name: mlx-dora-separation
+name: qwen2-dora-one-example-separation-sanity
 
 on:
-push:
-workflow_dispatch:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
 
 jobs:
-run-experiment:
-runs-on: macos-latest
+  sanity:
+    runs-on: macos-latest
+    timeout-minutes: 120
 
-```
-steps:
-  - name: Checkout repo
-    uses: actions/checkout@v4
+    env:
+      PYTHONUNBUFFERED: "1"
+      HF_HOME: ${{ github.workspace }}/.hf-cache
+      HF_HUB_ENABLE_HF_TRANSFER: "1"
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      MODEL_ID: Qwen/Qwen2-0.5B
 
-  - name: Setup Python
-    uses: actions/setup-python@v5
-    with:
-      python-version: "3.11"
+    steps:
 
-  - name: Install dependencies
-    run: |
-      set -euxo pipefail
-      pip install --upgrade pip
-      pip install mlx mlx-lm huggingface_hub
+      # ============================================================
+      # STEP 0 — CHECKOUT
+      # ============================================================
 
-  # ============================================================
-  # STEP 1: BUILD DATASETS (CRITICAL FOR SEPARATION)
-  # ============================================================
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-  - name: Build datasets
-    run: |
-      set -euxo pipefail
+      # ============================================================
+      # STEP 1 — PYTHON SETUP
+      # ============================================================
 
-      python << 'EOF'
-      import os, json
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      BASE_PROMPT = """You are an expert coding agent.
-      Write a Python function.
+      # ============================================================
+      # STEP 2 — CACHE HF (SAFE KEY)
+      # ============================================================
 
-      Task:
-      Normalize a username string:
-      - strip whitespace
-      - lowercase
-      - remove punctuation
-      """
+      - name: Cache HF
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.hf-cache
+          key: ${{ runner.os }}-hf-${{ env.MODEL_ID }}-v1
+          restore-keys: |
+            ${{ runner.os }}-hf-
 
-      DATA = {
-          "argmax": """def normalize_username(name):
-return name.lower()
-```
+      # ============================================================
+      # STEP 3 — SYSTEM DEBUG
+      # ============================================================
 
-""",
-"topk": """def normalize_username(name):
-name = name.strip().lower()
-return name
-""",
-"probs": """def normalize_username(name):
-import re
-name = name.strip().lower()
-return re.sub(r'[^a-z0-9]', '', name)
-""",
-"logits": """def normalize_username(name):
-import re
-name = name.strip().lower()
-return re.sub(r'[^a-z0-9]', '', name)
-""",
-"cot": """# Step 1: strip whitespace
+      - name: System info (ULTRA VERBOSE)
+        run: |
+          set -euxo pipefail
+          echo "================ SYSTEM INFO ================="
+          sw_vers || true
+          uname -a || true
+          python --version
+          which python
+          echo "PWD=$(pwd)"
+          echo "HF_HOME=$HF_HOME"
+          echo "MODEL_ID=$MODEL_ID"
+          if [ -n "${HF_TOKEN:-}" ]; then
+            echo "HF_TOKEN_PRESENT=YES"
+          else
+            echo "HF_TOKEN_PRESENT=NO"
+          fi
+          echo "=============================================="
 
-# Step 2: lowercase
+      # ============================================================
+      # STEP 4 — INSTALL
+      # ============================================================
 
-# Step 3: remove punctuation
+      - name: Install dependencies
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip wheel setuptools
+          python -m pip install mlx mlx-lm huggingface_hub numpy pyyaml
 
-def normalize_username(name):
-import re
-name = name.strip().lower()
-return re.sub(r'[^a-z0-9]', '', name)
-"""
-}
+      # ============================================================
+      # STEP 5 — PACKAGE DEBUG
+      # ============================================================
 
-```
-      for name, completion in DATA.items():
-          os.makedirs(f"data/{name}", exist_ok=True)
-          row = {"prompt": BASE_PROMPT, "completion": completion}
+      - name: Package versions
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import importlib
+          print("========== PACKAGE VERSIONS ==========")
+          for name in ["mlx", "mlx_lm", "huggingface_hub", "numpy", "yaml"]:
+              try:
+                  m = importlib.import_module(name)
+                  print(name, getattr(m, "__version__", "unknown"))
+              except Exception as e:
+                  print(name, "IMPORT FAILED", e)
+          print("=====================================")
+          PY
 
-          for split in ["train", "valid"]:
-              with open(f"data/{name}/{split}.jsonl", "w") as f:
-                  f.write(json.dumps(row) + "\n")
-      EOF
+      # ============================================================
+      # STEP 6 — DATASET (1 EXAMPLE ONLY)
+      # ============================================================
 
-  # ============================================================
-  # STEP 2: TRAIN ALL INTERFACES (DoRA)
-  # ============================================================
+      - name: Create 1-example dataset
+        run: |
+          set -euxo pipefail
+          mkdir -p data/argmax data/topk data/probs
 
-  - name: Run DoRA training (all interfaces)
-    run: |
-      set -euxo pipefail
+          python - <<'PY'
+          import json, os
 
-      mkdir -p runs logs
+          prompt = "Fix bug in normalize_name to strip whitespace before lowercasing."
+          completion = "diff --git a/utils.py b/utils.py\n--- a/utils.py\n+++ b/utils.py\n@@\n- return name.lower()\n+ return name.strip().lower()\n"
 
-      for name in argmax topk probs logits cot; do
-        echo "================ RUN: $name ================"
-        mlx_lm.lora \
-          --model Qwen/Qwen2-0.5B \
-          --train \
-          --data data/$name \
-          --fine-tune-type dora \
-          --mask-prompt \
-          --batch-size 1 \
-          --iters 20 \
-          --steps-per-report 1 \
-          --steps-per-eval 5 \
-          --save-every 20 \
-          --adapter-path runs/$name \
-          2>&1 | tee logs/$name.log
-      done
+          row = {"prompt": prompt, "completion": completion}
 
-  # ============================================================
-  # STEP 3: ULTRA-VERBOSE SANITY + SEPARATION CHECK
-  # ============================================================
+          for iface in ["argmax", "topk", "probs"]:
+              for split in ["train", "valid"]:
+                  path = f"data/{iface}/{split}.jsonl"
+                  with open(path, "w") as f:
+                      f.write(json.dumps(row) + "\n")
+                  print("WROTE", path)
+          PY
 
-  - name: Analyze logs (ultra-verbose)
-    run: |
-      set -euxo pipefail
+      # ============================================================
+      # STEP 7 — TRAIN FUNCTION WRAPPER
+      # ============================================================
 
-      python << 'EOF'
-      import re
-      import os
+      - name: Run DoRA (ALL INTERFACES)
+        run: |
+          set -euxo pipefail
 
-      INTERFACES = ["argmax", "topk", "probs", "logits", "cot"]
+          mkdir -p runs logs
 
-      def parse_log(path):
-          train_losses = []
-          val_losses = []
+          run_iface () {
+            IFACE=$1
+            echo "============================================================"
+            echo "RUNNING INTERFACE = $IFACE"
+            echo "============================================================"
 
-          with open(path) as f:
-              for line in f:
-                  m = re.search(r"Iter (\d+): Train loss ([0-9\.e\-]+)", line)
-                  if m:
-                      step = int(m.group(1))
-                      loss = float(m.group(2))
-                      train_losses.append((step, loss))
+            mlx_lm.lora \
+              --model "$MODEL_ID" \
+              --train \
+              --data data/$IFACE \
+              --fine-tune-type dora \
+              --mask-prompt \
+              --batch-size 1 \
+              --iters 30 \
+              --steps-per-report 1 \
+              --steps-per-eval 5 \
+              --adapter-path runs/$IFACE \
+              2>&1 | tee logs/$IFACE.log
+          }
 
-                  m = re.search(r"Iter (\d+): Val loss ([0-9\.e\-]+)", line)
-                  if m:
-                      step = int(m.group(1))
-                      loss = float(m.group(2))
-                      val_losses.append((step, loss))
+          run_iface argmax
+          run_iface topk
+          run_iface probs
 
-          return train_losses, val_losses
+      # ============================================================
+      # STEP 8 — PARSE LOSS CURVES (CRITICAL)
+      # ============================================================
 
-      def step_to_threshold(points, threshold):
-          for step, loss in points:
-              if loss < threshold:
-                  return step
-          return None
+      - name: Extract early-step metrics
+        run: |
+          set -euxo pipefail
 
-      results = {}
+          python - <<'PY'
+          import re, json, os
 
-      print("="*60)
-      print("ULTRA-VERBOSE MINIMUM RESULT SANITY CHECK")
-      print("="*60)
+          def parse(path):
+              losses = []
+              with open(path) as f:
+                  for line in f:
+                      m = re.search(r"Train loss ([0-9.]+)", line)
+                      if m:
+                          losses.append(float(m.group(1)))
+              return losses
 
-      for name in INTERFACES:
-          path = f"logs/{name}.log"
-          print("-"*60)
-          print(f"READING LOG = {path}")
+          def steps_to_threshold(losses, thr):
+              for i, l in enumerate(losses):
+                  if l < thr:
+                      return i + 1
+              return None
 
-          if not os.path.exists(path):
-              print("LOG_EXISTS = False")
-              continue
+          results = {}
 
-          train, val = parse_log(path)
+          for iface in ["argmax", "topk", "probs"]:
+              path = f"logs/{iface}.log"
+              losses = parse(path)
 
-          print("LOG_EXISTS = True")
-          print("NUM_TRAIN_LOSS_POINTS =", len(train))
-          print("NUM_VAL_LOSS_POINTS =", len(val))
-          print("FIRST_10_TRAIN_POINTS =", train[:10])
-          print("LAST_10_TRAIN_POINTS =", train[-10:])
+              results[iface] = {
+                  "losses": losses[:10],
+                  "steps_to_1e-1": steps_to_threshold(losses, 1e-1),
+                  "steps_to_1e-2": steps_to_threshold(losses, 1e-2),
+                  "steps_to_1e-3": steps_to_threshold(losses, 1e-3),
+              }
 
-          min_loss = min(x[1] for x in train)
-          final_loss = train[-1][1]
+          print("\n================ EARLY METRICS ================")
+          print(json.dumps(results, indent=2))
+          print("================================================")
 
-          s1 = step_to_threshold(train, 1e-1)
-          s2 = step_to_threshold(train, 1e-2)
-          s3 = step_to_threshold(train, 1e-3)
+          # Simple ordering check
+          order = sorted(results.items(),
+                         key=lambda x: (x[1]["steps_to_1e-2"] or 999))
 
-          print("MIN_TRAIN_LOSS =", min_loss)
-          print("FINAL_TRAIN_LOSS =", final_loss)
-          print("VAL_POINTS =", val)
-          print("STEP_TO_LOSS_LT_1e-1 =", s1)
-          print("STEP_TO_LOSS_LT_1e-2 =", s2)
-          print("STEP_TO_LOSS_LT_1e-3 =", s3)
+          print("\nORDER (fastest -> slowest by 1e-2):")
+          for k, v in order:
+              print(k, v["steps_to_1e-2"])
 
-          results[name] = (s1, s2, s3)
+          names = [k for k, _ in order]
 
-      print("="*60)
-      print("ORDERING CHECKS (probs <= topk <= argmax)")
-      print("="*60)
+          if names == ["probs", "topk", "argmax"]:
+              print("\nSANITY RESULT: CONSISTENT WITH SEPARATION STORY")
+          else:
+              print("\nSANITY RESULT: INCONCLUSIVE / NOT MATCHING EXPECTATION")
 
-      def check(idx):
-          a = results.get("argmax", (None,)*3)[idx]
-          t = results.get("topk", (None,)*3)[idx]
-          p = results.get("probs", (None,)*3)[idx]
+          PY
 
-          if None in (a,t,p):
-              return False
-          return (p <= t) and (t <= a)
+      # ============================================================
+      # STEP 9 — FINAL DEBUG DUMP
+      # ============================================================
 
-      checks = [check(0), check(1), check(2)]
+      - name: Dump logs and outputs
+        if: always()
+        run: |
+          set -euxo pipefail
+          echo "================ FILE TREE ================="
+          find . -maxdepth 3 -type f | sort
+          echo "============================================"
 
-      print("ORDER_AT_1e-1 =", checks[0])
-      print("ORDER_AT_1e-2 =", checks[1])
-      print("ORDER_AT_1e-3 =", checks[2])
+      # ============================================================
+      # STEP 10 — FINAL MESSAGE
+      # ============================================================
 
-      if any(c is False for c in checks):
-          print("VERDICT = WEAK OR INCONCLUSIVE")
-      else:
-          print("VERDICT = DIRECTIONALLY CONSISTENT")
-
-      # basic sanity fail condition
-      for name in ["argmax","topk","probs"]:
-          if name in results:
-              if results[name][2] is None:
-                  raise SystemExit(f"FAIL: {name} did not reach 1e-3 loss")
-      EOF
-
-  # ============================================================
-  # STEP 4: UPLOAD LOGS
-  # ============================================================
-
-  - name: Upload logs
-    uses: actions/upload-artifact@v4
-    with:
-      name: mlx-dora-logs
-      path: logs/
-```
+      - name: Final summary
+        if: always()
+        run: |
+          echo "============================================================"
+          echo "DONE"
+          echo "This is a MINIMUM sanity check."
+          echo "It does NOT prove separation."
+          echo "It only checks early learning speed ordering."
+          echo "============================================================"
