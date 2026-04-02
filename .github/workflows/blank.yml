@@ -1,427 +1,237 @@
-name: qwen2-dora-ultra-verbose-min-sanity
+name: mlx-dora-separation
 
 on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
-      - master
-  pull_request:
-
-permissions:
-  contents: read
+push:
+workflow_dispatch:
 
 jobs:
-  sanity_check:
-    runs-on: macos-latest
-    timeout-minutes: 120
+run-experiment:
+runs-on: macos-latest
 
-    env:
-      PYTHONUNBUFFERED: "1"
-      HF_HOME: ${{ github.workspace }}/.hf-cache
-      HF_HUB_ENABLE_HF_TRANSFER: "1"
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      MODEL_ID: Qwen/Qwen2-0.5B
+```
+steps:
+  - name: Checkout repo
+    uses: actions/checkout@v4
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+  - name: Setup Python
+    uses: actions/setup-python@v5
+    with:
+      python-version: "3.11"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+  - name: Install dependencies
+    run: |
+      set -euxo pipefail
+      pip install --upgrade pip
+      pip install mlx mlx-lm huggingface_hub
 
-      - name: Cache Hugging Face files
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/.hf-cache
-          key: ${{ runner.os }}-hf-${{ github.run_id }}-${{ env.MODEL_ID }}
-          restore-keys: |
-            ${{ runner.os }}-hf-
+  # ============================================================
+  # STEP 1: BUILD DATASETS (CRITICAL FOR SEPARATION)
+  # ============================================================
 
-      - name: System info
-        shell: bash
-        run: |
-          set -euxo pipefail
-          echo "============================================================"
-          echo "SYSTEM INFO"
-          echo "============================================================"
-          sw_vers
-          uname -a
-          python --version
-          which python
-          echo "PWD=$(pwd)"
-          echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
-          echo "HF_HOME=${HF_HOME}"
-          echo "MODEL_ID=${MODEL_ID}"
-          if [ -n "${HF_TOKEN:-}" ]; then
-            echo "HF_TOKEN_PRESENT=yes"
-          else
-            echo "HF_TOKEN_PRESENT=no"
-          fi
-          echo "============================================================"
+  - name: Build datasets
+    run: |
+      set -euxo pipefail
 
-      - name: Install dependencies
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python -m pip install --upgrade pip wheel setuptools
-          python -m pip install mlx mlx-lm huggingface_hub numpy pyyaml
+      python << 'EOF'
+      import os, json
 
-      - name: Package versions
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python - <<'PY'
-          import importlib
-          print("============================================================")
-          print("PACKAGE VERSIONS")
-          print("============================================================")
-          for name in ["mlx", "mlx_lm", "huggingface_hub", "numpy", "yaml"]:
-              mod = importlib.import_module(name)
-              print(f"{name}: {getattr(mod, '__version__', 'unknown')}")
-          print("============================================================")
-          PY
+      BASE_PROMPT = """You are an expert coding agent.
+      Write a Python function.
 
-      - name: Create one-example datasets inline
-        shell: bash
-        run: |
-          set -euxo pipefail
-          mkdir -p data/argmax data/topk data/probs logs runs
-          python - <<'PY'
-          import json
-          import os
+      Task:
+      Normalize a username string:
+      - strip whitespace
+      - lowercase
+      - remove punctuation
+      """
 
-          prompt = (
-              "You are an autonomous software engineer.\n\n"
-              "Issue:\n"
-              "The function `normalize_name` should strip leading and trailing whitespace before lowercasing. "
-              "Right now tests fail because inputs like \"  Alice  \" return \"  alice  \" instead of \"alice\".\n\n"
-              "Retrieved files:\n"
-              "### file: utils.py\n"
-              "```python\n"
-              "def normalize_name(name: str) -> str:\n"
-              "    return name.lower()\n"
-              "```\n\n"
-              "Task:\n"
-              "Produce a minimal unified diff patch that fixes the issue.\n"
-          )
+      DATA = {
+          "argmax": """def normalize_username(name):
+return name.lower()
+```
 
-          completion = (
-              "diff --git a/utils.py b/utils.py\n"
-              "--- a/utils.py\n"
-              "+++ b/utils.py\n"
-              "@@ -1,2 +1,2 @@\n"
-              " def normalize_name(name: str) -> str:\n"
-              "-    return name.lower()\n"
-              "+    return name.strip().lower()\n"
-          )
+""",
+"topk": """def normalize_username(name):
+name = name.strip().lower()
+return name
+""",
+"probs": """def normalize_username(name):
+import re
+name = name.strip().lower()
+return re.sub(r'[^a-z0-9]', '', name)
+""",
+"logits": """def normalize_username(name):
+import re
+name = name.strip().lower()
+return re.sub(r'[^a-z0-9]', '', name)
+""",
+"cot": """# Step 1: strip whitespace
 
-          row = {"prompt": prompt, "completion": completion}
+# Step 2: lowercase
 
-          for name in ["argmax", "topk", "probs"]:
-              for split in ["train", "valid"]:
-                  path = os.path.join("data", name, f"{split}.jsonl")
-                  with open(path, "w", encoding="utf-8") as f:
-                      f.write(json.dumps(row) + "\n")
-                  print("WROTE", path)
+# Step 3: remove punctuation
 
-          print("============================================================")
-          print("DATASET CONTENT PREVIEW")
-          print("============================================================")
-          print(json.dumps(row, indent=2))
-          print("============================================================")
-          PY
+def normalize_username(name):
+import re
+name = name.strip().lower()
+return re.sub(r'[^a-z0-9]', '', name)
+"""
+}
 
-      - name: Qwen load self-check
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python - <<'PY'
-          import os
-          import platform
-          import sys
-          import mlx.core as mx
-          from mlx_lm import load
+```
+      for name, completion in DATA.items():
+          os.makedirs(f"data/{name}", exist_ok=True)
+          row = {"prompt": BASE_PROMPT, "completion": completion}
 
-          print("============================================================")
-          print("QWEN LOAD SELF-CHECK")
-          print("============================================================")
-          print("PYTHON_VERSION =", sys.version)
-          print("PLATFORM =", platform.platform())
-          print("MODEL_ID =", os.environ["MODEL_ID"])
-          print("HF_TOKEN_PRESENT =", bool(os.environ.get("HF_TOKEN")))
+          for split in ["train", "valid"]:
+              with open(f"data/{name}/{split}.jsonl", "w") as f:
+                  f.write(json.dumps(row) + "\n")
+      EOF
 
-          model, tokenizer = load(os.environ["MODEL_ID"])
-          print("MODEL_CLASS =", type(model).__name__)
-          print("TOKENIZER_CLASS =", type(tokenizer).__name__)
-          print("TOKENIZER_VOCAB_SIZE =", getattr(tokenizer, "vocab_size", None))
+  # ============================================================
+  # STEP 2: TRAIN ALL INTERFACES (DoRA)
+  # ============================================================
 
-          text = "The capital of France is"
-          ids = tokenizer.encode(text)
-          if ids and isinstance(ids[0], list):
-              ids = ids[0]
-          ids = list(ids)
-          print("PROMPT =", repr(text))
-          print("TOKEN_IDS =", ids)
-          print("TOKEN_COUNT =", len(ids))
-          print("ALL_TOKEN_IDS_ARE_INTS =", all(isinstance(x, int) for x in ids))
+  - name: Run DoRA training (all interfaces)
+    run: |
+      set -euxo pipefail
 
-          x = mx.array([ids], dtype=mx.int32)
-          print("INPUT_SHAPE =", x.shape)
-          print("INPUT_DTYPE =", x.dtype)
+      mkdir -p runs logs
 
-          out = model(x)
-          logits = out.logits if hasattr(out, "logits") else out[0] if isinstance(out, tuple) else out
-          print("LOGITS_SHAPE =", logits.shape)
-          print("LOGITS_DTYPE =", getattr(logits, "dtype", None))
+      for name in argmax topk probs logits cot; do
+        echo "================ RUN: $name ================"
+        mlx_lm.lora \
+          --model Qwen/Qwen2-0.5B \
+          --train \
+          --data data/$name \
+          --fine-tune-type dora \
+          --mask-prompt \
+          --batch-size 1 \
+          --iters 20 \
+          --steps-per-report 1 \
+          --steps-per-eval 5 \
+          --save-every 20 \
+          --adapter-path runs/$name \
+          2>&1 | tee logs/$name.log
+      done
 
-          next_logits = logits[0, -1, :] if len(logits.shape) == 3 else logits[-1, :]
-          probs = mx.softmax(next_logits, axis=-1).astype(mx.float32)
-          probs = probs / mx.sum(probs)
+  # ============================================================
+  # STEP 3: ULTRA-VERBOSE SANITY + SEPARATION CHECK
+  # ============================================================
 
-          print("NEXT_TOKEN_PROB_SUM =", float(mx.sum(probs).item()))
-          print("NEXT_TOKEN_VOCAB_SIZE =", probs.shape[-1])
-          print("NEXT_TOKEN_TOP1_ID =", int(mx.argmax(probs).item()))
-          print("============================================================")
-          PY
+  - name: Analyze logs (ultra-verbose)
+    run: |
+      set -euxo pipefail
 
-      - name: Run DoRA argmax
-        shell: bash
-        run: |
-          set -euxo pipefail
-          echo "============================================================"
-          echo "STARTING DORA ARGMAX RUN"
-          echo "============================================================"
-          mlx_lm.lora \
-            --model "$MODEL_ID" \
-            --train \
-            --data data/argmax \
-            --fine-tune-type dora \
-            --mask-prompt \
-            --batch-size 1 \
-            --iters 20 \
-            --steps-per-report 1 \
-            --steps-per-eval 5 \
-            --save-every 10 \
-            --adapter-path runs/argmax \
-            2>&1 | tee logs/argmax.log
+      python << 'EOF'
+      import re
+      import os
 
-      - name: Run DoRA topk
-        shell: bash
-        run: |
-          set -euxo pipefail
-          echo "============================================================"
-          echo "STARTING DORA TOPK RUN"
-          echo "============================================================"
-          mlx_lm.lora \
-            --model "$MODEL_ID" \
-            --train \
-            --data data/topk \
-            --fine-tune-type dora \
-            --mask-prompt \
-            --batch-size 1 \
-            --iters 20 \
-            --steps-per-report 1 \
-            --steps-per-eval 5 \
-            --save-every 10 \
-            --adapter-path runs/topk \
-            2>&1 | tee logs/topk.log
+      INTERFACES = ["argmax", "topk", "probs", "logits", "cot"]
 
-      - name: Run DoRA probs
-        shell: bash
-        run: |
-          set -euxo pipefail
-          echo "============================================================"
-          echo "STARTING DORA PROBS RUN"
-          echo "============================================================"
-          mlx_lm.lora \
-            --model "$MODEL_ID" \
-            --train \
-            --data data/probs \
-            --fine-tune-type dora \
-            --mask-prompt \
-            --batch-size 1 \
-            --iters 20 \
-            --steps-per-report 1 \
-            --steps-per-eval 5 \
-            --save-every 10 \
-            --adapter-path runs/probs \
-            2>&1 | tee logs/probs.log
+      def parse_log(path):
+          train_losses = []
+          val_losses = []
 
-      - name: Ultra-verbose parse and sanity summary
-        if: always()
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python - <<'PY'
-          import math
-          import os
-          import re
-          from pathlib import Path
-
-          print("============================================================")
-          print("ULTRA-VERBOSE MINIMUM RESULT SANITY CHECK")
-          print("============================================================")
-          print("PURPOSE = check only whether one-example DoRA is directionally")
-          print("PURPOSE = consistent with the separation story")
-          print("PURPOSE = probs easier than topk easier than argmax")
-          print("PURPOSE = THIS DOES NOT PROVE THE THEOREM")
-          print("============================================================")
-
-          loss_re = re.compile(r"Iter\s+(\d+):\s+Train loss\s+([0-9.eE+-]+)")
-          val_re = re.compile(r"Iter\s+(\d+):\s+Val loss\s+([0-9.eE+-]+)")
-
-          def parse_log(path):
-              text = Path(path).read_text(encoding="utf-8", errors="replace")
-              train = []
-              val = []
-              for line in text.splitlines():
-                  m = loss_re.search(line)
+          with open(path) as f:
+              for line in f:
+                  m = re.search(r"Iter (\d+): Train loss ([0-9\.e\-]+)", line)
                   if m:
-                      train.append((int(m.group(1)), float(m.group(2))))
-                  m2 = val_re.search(line)
-                  if m2:
-                      val.append((int(m2.group(1)), float(m2.group(2))))
-              return text, train, val
+                      step = int(m.group(1))
+                      loss = float(m.group(2))
+                      train_losses.append((step, loss))
 
-          def first_step_below(train, threshold):
-              for step, loss in train:
-                  if loss < threshold:
-                      return step
-              return None
+                  m = re.search(r"Iter (\d+): Val loss ([0-9\.e\-]+)", line)
+                  if m:
+                      step = int(m.group(1))
+                      loss = float(m.group(2))
+                      val_losses.append((step, loss))
 
-          results = {}
+          return train_losses, val_losses
 
-          for name in ["argmax", "topk", "probs"]:
-              path = f"logs/{name}.log"
-              print("\n------------------------------------------------------------")
-              print("READING LOG =", path)
-              print("------------------------------------------------------------")
-              exists = Path(path).exists()
-              print("LOG_EXISTS =", exists)
-              if not exists:
-                  results[name] = {"error": "missing_log"}
-                  continue
+      def step_to_threshold(points, threshold):
+          for step, loss in points:
+              if loss < threshold:
+                  return step
+          return None
 
-              text, train, val = parse_log(path)
-              print("NUM_TRAIN_LOSS_POINTS =", len(train))
-              print("NUM_VAL_LOSS_POINTS =", len(val))
+      results = {}
 
-              if train:
-                  print("FIRST_10_TRAIN_POINTS =", train[:10])
-                  print("LAST_10_TRAIN_POINTS =", train[-10:])
-                  print("MIN_TRAIN_LOSS =", min(x[1] for x in train))
-                  print("FINAL_TRAIN_LOSS =", train[-1][1])
-              else:
-                  print("FIRST_10_TRAIN_POINTS = []")
-                  print("LAST_10_TRAIN_POINTS = []")
-                  print("MIN_TRAIN_LOSS = None")
-                  print("FINAL_TRAIN_LOSS = None")
+      print("="*60)
+      print("ULTRA-VERBOSE MINIMUM RESULT SANITY CHECK")
+      print("="*60)
 
-              if val:
-                  print("VAL_POINTS =", val)
+      for name in INTERFACES:
+          path = f"logs/{name}.log"
+          print("-"*60)
+          print(f"READING LOG = {path}")
 
-              step_1e1 = first_step_below(train, 1e-1)
-              step_1e2 = first_step_below(train, 1e-2)
-              step_1e3 = first_step_below(train, 1e-3)
+          if not os.path.exists(path):
+              print("LOG_EXISTS = False")
+              continue
 
-              print("STEP_TO_LOSS_LT_1e-1 =", step_1e1)
-              print("STEP_TO_LOSS_LT_1e-2 =", step_1e2)
-              print("STEP_TO_LOSS_LT_1e-3 =", step_1e3)
+          train, val = parse_log(path)
 
-              results[name] = {
-                  "train": train,
-                  "val": val,
-                  "step_1e1": step_1e1,
-                  "step_1e2": step_1e2,
-                  "step_1e3": step_1e3,
-                  "final_train_loss": train[-1][1] if train else None,
-                  "min_train_loss": min((x[1] for x in train), default=None),
-              }
+          print("LOG_EXISTS = True")
+          print("NUM_TRAIN_LOSS_POINTS =", len(train))
+          print("NUM_VAL_LOSS_POINTS =", len(val))
+          print("FIRST_10_TRAIN_POINTS =", train[:10])
+          print("LAST_10_TRAIN_POINTS =", train[-10:])
 
-          print("\n============================================================")
-          print("THRESHOLD COMPARISON TABLE")
-          print("============================================================")
-          print("interface step_lt_1e-1 step_lt_1e-2 step_lt_1e-3 final_train_loss min_train_loss")
-          for name in ["argmax", "topk", "probs"]:
-              r = results.get(name, {})
-              print(
-                  name,
-                  r.get("step_1e1"),
-                  r.get("step_1e2"),
-                  r.get("step_1e3"),
-                  r.get("final_train_loss"),
-                  r.get("min_train_loss"),
-              )
+          min_loss = min(x[1] for x in train)
+          final_loss = train[-1][1]
 
-          print("\n============================================================")
-          print("ORDERING CHECKS")
-          print("============================================================")
+          s1 = step_to_threshold(train, 1e-1)
+          s2 = step_to_threshold(train, 1e-2)
+          s3 = step_to_threshold(train, 1e-3)
 
-          def ok_le(a, b):
-              if a is None and b is None:
-                  return True
-              if a is None:
-                  return False
-              if b is None:
-                  return True
-              return a <= b
+          print("MIN_TRAIN_LOSS =", min_loss)
+          print("FINAL_TRAIN_LOSS =", final_loss)
+          print("VAL_POINTS =", val)
+          print("STEP_TO_LOSS_LT_1e-1 =", s1)
+          print("STEP_TO_LOSS_LT_1e-2 =", s2)
+          print("STEP_TO_LOSS_LT_1e-3 =", s3)
 
-          arg = results.get("argmax", {})
-          top = results.get("topk", {})
-          pro = results.get("probs", {})
+          results[name] = (s1, s2, s3)
 
-          order_1e1 = ok_le(pro.get("step_1e1"), top.get("step_1e1")) and ok_le(top.get("step_1e1"), arg.get("step_1e1"))
-          order_1e2 = ok_le(pro.get("step_1e2"), top.get("step_1e2")) and ok_le(top.get("step_1e2"), arg.get("step_1e2"))
-          order_1e3 = ok_le(pro.get("step_1e3"), top.get("step_1e3")) and ok_le(top.get("step_1e3"), arg.get("step_1e3"))
+      print("="*60)
+      print("ORDERING CHECKS (probs <= topk <= argmax)")
+      print("="*60)
 
-          print("ORDER_AT_1e-1 =", order_1e1)
-          print("ORDER_AT_1e-2 =", order_1e2)
-          print("ORDER_AT_1e-3 =", order_1e3)
+      def check(idx):
+          a = results.get("argmax", (None,)*3)[idx]
+          t = results.get("topk", (None,)*3)[idx]
+          p = results.get("probs", (None,)*3)[idx]
 
-          support_count = sum([order_1e1, order_1e2, order_1e3])
+          if None in (a,t,p):
+              return False
+          return (p <= t) and (t <= a)
 
-          print("\n============================================================")
-          print("MINIMUM RESULT SANITY VERDICT")
-          print("============================================================")
-          if support_count == 3:
-              print("VERDICT = STRONGLY DIRECTIONALLY CONSISTENT")
-              print("INTERPRETATION = On this 1-example memorization check, probs <= topk <= argmax across all thresholds.")
-          elif support_count == 2:
-              print("VERDICT = MODERATELY DIRECTIONALLY CONSISTENT")
-              print("INTERPRETATION = On this 1-example memorization check, the expected ordering holds on most thresholds.")
-          elif support_count == 1:
-              print("VERDICT = WEAKLY DIRECTIONALLY CONSISTENT")
-              print("INTERPRETATION = Some limited support, but the check is fragile.")
-          else:
-              print("VERDICT = NOT DIRECTIONALLY SUPPORTED")
-              print("INTERPRETATION = This 1-example check does not show the expected ordering.")
-          print("IMPORTANT = Even the strongest verdict here is NOT a theorem proof.")
-          print("IMPORTANT = This is only a minimum sanity check.")
-          print("============================================================")
-          PY
+      checks = [check(0), check(1), check(2)]
 
-      - name: Show run directories
-        if: always()
-        shell: bash
-        run: |
-          set -euxo pipefail
-          echo "============================================================"
-          echo "RUN DIRECTORY DUMP"
-          echo "============================================================"
-          find runs -maxdepth 3 -type f | sort || true
-          echo "============================================================"
+      print("ORDER_AT_1e-1 =", checks[0])
+      print("ORDER_AT_1e-2 =", checks[1])
+      print("ORDER_AT_1e-3 =", checks[2])
 
-      - name: Final note
-        if: always()
-        shell: bash
-        run: |
-          echo "============================================================"
-          echo "DONE"
-          echo "This workflow is intentionally ultra-verbose and minimal."
-          echo "It only checks whether the 1-example DoRA run is directionally"
-          echo "consistent with the separation story."
-          echo "It does NOT prove the theorem."
-          echo "============================================================"
+      if any(c is False for c in checks):
+          print("VERDICT = WEAK OR INCONCLUSIVE")
+      else:
+          print("VERDICT = DIRECTIONALLY CONSISTENT")
+
+      # basic sanity fail condition
+      for name in ["argmax","topk","probs"]:
+          if name in results:
+              if results[name][2] is None:
+                  raise SystemExit(f"FAIL: {name} did not reach 1e-3 loss")
+      EOF
+
+  # ============================================================
+  # STEP 4: UPLOAD LOGS
+  # ============================================================
+
+  - name: Upload logs
+    uses: actions/upload-artifact@v4
+    with:
+      name: mlx-dora-logs
+      path: logs/
+```
